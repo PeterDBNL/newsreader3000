@@ -108,7 +108,7 @@ async function onTasksFinished(list) {
     const full = all.find((x) => x.id === t.id);
     if (full) toast(`${full.label}: ${full.status === "error" ? "failed – " : ""}${full.message || full.status}`, full.status === "error");
   }
-  if (state.view === "browse") { loadGroupSidebar(); loadBrowse(); }
+  if (state.view === "browse") { loadGroupSidebar(); loadBrowse(); loadGroupInfo(); }
   if (state.view === "groups") loadGroups();
 }
 $("#tasksind").onclick = showTasks;
@@ -157,7 +157,7 @@ function selectionBar(mode) {
     <button onclick="downloadSelected()">⬇ Download</button>
     <button class="sec" onclick="saveNzb()">Save NZB</button>
     ${mode !== "search" ? `<button class="sec" onclick="markSelected(1)">Mark read</button>` : ""}
-    <button class="sec" onclick="clearSel()">Clear</button></div>`;
+    <button class="sec" onclick="clearSel()">Clear</button><span class="muted small hm">Tip: Shift-click selects a range</span></div>`;
 }
 function bindResults(container, mode) {
   const kind = mode === "articles" ? "article" : mode === "files" ? "file" : "release";
@@ -167,20 +167,37 @@ function bindResults(container, mode) {
     bar.classList.toggle("hidden", !state.selected.size);
     $("#selcount").textContent = `${state.selected.size} selected`;
   };
-  $$(".selbox", container).forEach((cb) => {
+  const boxes = $$(".selbox", container);
+  const setSel = (cb, on) => {
+    const it = state.lastResults[cb.dataset.i];
+    const id = kind === "article" ? "a" + it.id : it.grp + "\u0000" + it.k;
+    cb.checked = on;
+    if (on) state.selected.set(id, kind === "article" ? { kind, id: it.id, grp: it.grp, name: it.subject } : { kind, grp: it.grp, key: it.k, name: it.name });
+    else state.selected.delete(id);
+    cb.closest("tr").classList.toggle("sel", on);
+  };
+  // Click a checkbox or an empty part of a row to select it; hold Shift to select everything in between.
+  let last = null;
+  const toggle = (i, on, shift) => {
+    if (shift && last !== null) {
+      const [a, b] = [Math.min(last, i), Math.max(last, i)];
+      for (let j = a; j <= b; j++) setSel(boxes[j], on);
+    } else setSel(boxes[i], on);
+    last = i;
+    update();
+  };
+  boxes.forEach((cb, i) => {
     const it = state.lastResults[cb.dataset.i];
     const id = kind === "article" ? "a" + it.id : it.grp + "\u0000" + it.k;
     cb.checked = state.selected.has(id);
     cb.closest("tr").classList.toggle("sel", cb.checked);
-    cb.onchange = () => {
-      if (cb.checked) state.selected.set(id, kind === "article" ? { kind, id: it.id, grp: it.grp, name: it.subject } : { kind, grp: it.grp, key: it.k, name: it.name });
-      else state.selected.delete(id);
-      cb.closest("tr").classList.toggle("sel", cb.checked);
-      update();
-    };
+    cb.onclick = (e) => { e.stopPropagation(); toggle(i, cb.checked, e.shiftKey); };
+    const tr = cb.closest("tr");
+    tr.onmousedown = (e) => { if (e.shiftKey) e.preventDefault(); };  // no text selection on shift-click
+    tr.onclick = (e) => { if (e.target.closest("a,button,input")) return; toggle(i, !cb.checked, e.shiftKey); };
   });
   const all = $("#selall", container);
-  if (all) all.onchange = () => { $$(".selbox", container).forEach((cb) => { cb.checked = all.checked; cb.onchange(); }); };
+  if (all) all.onchange = () => { boxes.forEach((cb) => setSel(cb, all.checked)); update(); };
   update();
 }
 function clearSel() { state.selected.clear(); $$(".selbox").forEach((c) => { c.checked = false; c.closest("tr").classList.remove("sel"); }); $("#selbar")?.classList.add("hidden"); }
@@ -206,9 +223,12 @@ async function saveNzb() {
   });
 }
 async function markSelected(read) {
-  const ids = [...state.selected.values()].filter((s) => s.kind === "article").map((s) => s.id);
-  if (!ids.length) return toast("Mark read works on articles; use 'Mark all read' for releases");
-  await guard(() => post("/api/groups/mark-read", { ids, read: !!read }));
+  const sel = [...state.selected.values()];
+  const ids = sel.filter((s) => s.kind === "article").map((s) => s.id);
+  const releases = sel.filter((s) => s.kind === "release").map((s) => ({ grp: s.grp, key: s.key }));
+  if (!ids.length && !releases.length) return toast("Mark read works on releases and articles", true);
+  await guard(() => post("/api/groups/mark-read", { ids, releases, read: !!read }));
+  loadGroupSidebar();
   clearSel();
   loadBrowse();
 }
@@ -336,8 +356,10 @@ function viewBrowse() {
       <button class="small" onclick="fetchHeaders('new')" title="Download new headers">⟳ New headers</button>
       <button class="small sec" onclick="fetchOlder()" title="Download older headers">Older…</button>
       <button class="small sec" onclick="markAllRead()">Mark all read</button>
+      <button class="small sec" onclick="showHeaderLog(state.group)" title="Header download history">Header log</button>
       <button class="small sec" onclick="compose()">✎ Post</button>
     </div>
+    <div id="ginfo" class="small muted" style="margin:-4px 0 10px"></div>
     <div class="toolbar">
       <select id="bmode"><option value="releases">Releases</option><option value="files">Files</option><option value="articles">Articles</option></select>
       <input id="bq" class="grow" placeholder="Filter subjects…  (use -word to exclude)" value="${esc(st.q)}">
@@ -356,14 +378,47 @@ function viewBrowse() {
   for (const id of ["bq", "bmin", "bage"]) $("#" + id).oninput = () => { clearTimeout(tmr); tmr = setTimeout(() => { st.q = $("#bq").value; st.min_size = $("#bmin").value; st.max_age = $("#bage").value; reload(); }, 350); };
   loadGroupSidebar();
   loadBrowse();
+  loadGroupInfo();
+}
+async function loadGroupInfo() {
+  const el = $("#ginfo");
+  if (!el || !state.group) return;
+  const g = await api("/api/groups/info?name=" + encodeURIComponent(state.group)).catch(() => null);
+  if (!g) return;
+  const last = g.log && g.log[0];
+  el.innerHTML = g.last_fetched
+    ? `Stored: articles ${g.first_fetched.toLocaleString()}–${g.last_fetched.toLocaleString()} (${g.stored_articles.toLocaleString()} of ${g.available.toLocaleString()} on server) · ${(g.releases || 0).toLocaleString()} releases, ${(g.unread || 0).toLocaleString()} unread` +
+      (g.oldest ? ` · posts from ${new Date(g.oldest * 1000).toLocaleDateString()} to ${new Date(g.newest * 1000).toLocaleDateString()}` : "") +
+      (last ? ` · last fetch ${fmtAge(last.started)} ago: ${esc(last.status === "done" ? last.message : last.status + " " + (last.message || ""))}` : "")
+    : "No headers downloaded yet for this group.";
+}
+async function showHeaderLog(group) {
+  const rows = await api("/api/headers/log?limit=200" + (group ? "&group=" + encodeURIComponent(group) : "")).catch(() => []);
+  openModal(`<div class="toolbar" style="padding-right:30px"><h3 class="grow" style="margin:0">Header downloads${group ? " · " + esc(group) : ""}</h3>
+    ${group ? `<button class="small sec" onclick="showHeaderLog('')">All groups</button>` : ""}
+    <button class="small sec" onclick="post('/api/headers/log/clear').then(()=>showHeaderLog(${jsStr(group)}))">Clear</button></div>
+    ${headerLogTable(rows, !group)}`);
+}
+function headerLogTable(rows, showGroup) {
+  if (!rows.length) return '<div class="empty">No header downloads yet.</div>';
+  return `<table><tr><th>When</th>${showGroup ? "<th>Group</th>" : ""}<th>Type</th><th class="hm">Articles</th><th class="num">Received</th><th class="num">New</th><th class="num">Time</th><th class="num hm">Speed</th><th>Result</th></tr>
+    ${rows.map((r) => {
+      const secs = Math.max(1, (r.finished || Date.now() / 1000) - r.started);
+      return `<tr><td class="small" title="${esc(fmtDate(r.started))}">${fmtAge(r.started)} ago</td>${showGroup ? `<td class="small subj">${esc(r.grp)}</td>` : ""}
+      <td class="small">${esc({ new: "new", older: "older", reset: "reset" }[r.mode] || r.mode)}${r.compressed ? ' <span class="pill" title="Compressed transfer">gz</span>' : ""}</td>
+      <td class="small hm">${r.first ? r.first.toLocaleString() + "–" + r.last.toLocaleString() : ""}</td>
+      <td class="num">${(r.received || 0).toLocaleString()}</td><td class="num">${(r.inserted || 0).toLocaleString()}</td>
+      <td class="num">${Math.round(secs)}s</td><td class="num hm">${Math.round((r.received || 0) / secs).toLocaleString()}/s</td>
+      <td class="small status-${r.status === "done" ? "completed" : r.status === "error" ? "failed" : "paused"}">${esc(r.status === "done" ? "OK" : r.status)}${r.status === "error" ? ": " + esc(r.message) : ""}</td></tr>`;
+    }).join("")}</table>`;
 }
 async function loadGroupSidebar() {
   const el = $("#glist");
   if (!el) return;
   const r = await api("/api/groups?subscribed=1&limit=1000").catch((e) => ({ items: [], err: e.message }));
   if (!r.items.length) { el.innerHTML = `<div class="empty">No groups yet.<br><a onclick="go('groups')">Subscribe to groups</a></div>`; return; }
-  el.innerHTML = r.items.map((g) => `<div class="g ${g.name === state.group ? "active" : ""}" data-g="${esc(g.name)}"><span>${esc(g.name)}</span><small title="unread / stored headers">${g.stored ? (g.unread || 0).toLocaleString() : "–"}</small></div>`).join("");
-  $$(".g", el).forEach((d) => (d.onclick = () => { state.group = d.dataset.g; localStorage.setItem("nr.group", state.group); state.browse.offset = 0; state.selected.clear(); $$(".g", el).forEach((x) => x.classList.toggle("active", x === d)); $("#gtitle").textContent = state.group; loadBrowse(); }));
+  el.innerHTML = r.items.map((g) => `<div class="g ${g.name === state.group ? "active" : ""}" data-g="${esc(g.name)}"><span>${esc(g.name)}</span><small title="unread releases">${g.stored ? (g.unread || 0).toLocaleString() : "–"}</small></div>`).join("");
+  $$(".g", el).forEach((d) => (d.onclick = () => { state.group = d.dataset.g; localStorage.setItem("nr.group", state.group); state.browse.offset = 0; state.selected.clear(); $$(".g", el).forEach((x) => x.classList.toggle("active", x === d)); $("#gtitle").textContent = state.group; loadBrowse(); loadGroupInfo(); }));
 }
 async function loadBrowse() {
   const el = $("#bres");
@@ -447,7 +502,9 @@ async function viewGroups() {
     <div class="toolbar"><input id="gq" class="grow" placeholder="Filter, e.g. linux   or wildcards: alt.binaries.*.hd*" value="${esc(st.q)}">
       <select id="gsub"><option value="-1">All</option><option value="1">Subscribed</option><option value="0">Not subscribed</option></select>
       <select id="gsort"><option value="name">Name</option><option value="size">Most articles</option></select></div>
-    <div id="gres"></div></div>`;
+    <div id="gres"></div></div>
+    <div class="panel"><div class="toolbar"><h3 class="grow" style="margin:0">Header download history</h3>
+      <button class="small sec" onclick="showHeaderLog('')">Show all</button></div><div id="hlog"></div></div>`;
   const subs = new Set((await api("/api/groups?subscribed=1&limit=1000").catch(() => ({ items: [] }))).items.map((g) => g.name));
   $("#popular").innerHTML = popular.map((g) => `<span class="chip ${subs.has(g) ? "on" : ""}" data-g="${esc(g)}">${esc(g)}</span>`).join("");
   $$("#popular .chip").forEach((c) => (c.onclick = () => guard(async () => {
@@ -474,6 +531,7 @@ async function viewGroups() {
   loadGroups();
 }
 async function loadGroups() {
+  api("/api/headers/log?limit=15").then((rows) => { if ($("#hlog")) $("#hlog").innerHTML = headerLogTable(rows, true); }).catch(() => {});
   const st = state.groups;
   const el = $("#gres");
   if (!el) return;
@@ -642,7 +700,8 @@ async function viewSettings() {
     <label class="f">Auto-update subscribed groups every (minutes, 0 = off)<input data-k="headers.auto_update_minutes" data-type="int" value="${h.auto_update_minutes}"></label>
     <label class="f">Delete stored headers older than (days, 0 = keep)<input data-k="headers.retention_days" data-type="int" value="${h.retention_days}"></label>
     <label class="f">Popular groups list (comma separated)<input data-k="default_groups" data-type="list" value="${esc(s.default_groups.join(", "))}"></label></div>
-    <div style="margin-top:10px">${chk("headers.fetch_descriptions", h.fetch_descriptions, "Download group descriptions with the group list (slower)")}</div></div>
+    <div style="margin-top:10px">${chk("headers.fetch_descriptions", h.fetch_descriptions, "Download group descriptions with the group list (slower)")}
+    ${chk("headers.compression", h.compression !== false, "Compressed header download when the server supports it (XFEATURE COMPRESS GZIP, 3–5× less data)")}</div></div>
   <div class="panel"><h3>Posting</h3><div class="grid2">
     <label class="f">Your name<input data-k="posting.from_name" value="${esc(p.from_name)}"></label>
     <label class="f">E-mail (shown publicly – consider a munged address)<input data-k="posting.from_email" value="${esc(p.from_email)}"></label>

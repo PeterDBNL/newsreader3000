@@ -4,6 +4,7 @@ import email.utils
 import io
 import time
 import zipfile
+import zlib
 
 from app import yenc
 
@@ -16,6 +17,8 @@ class FakeServer:
         self.posted = []
         self.missing = set()
         self.reject_over = False  # mimic providers that only know XOVER
+        self.compression = False  # support XFEATURE COMPRESS GZIP
+        self.over_calls = 0
 
     def add(self, group, subject, body: bytes, poster="Tester <t@example.com>", msgid=None, refs=""):
         arts = self.groups.setdefault(group, [])
@@ -57,6 +60,7 @@ class FakeServer:
         send("200 fake server ready")
         authed = False
         group = None
+        compress = False
         while True:
             line = await r.readline()
             if not line:
@@ -75,6 +79,12 @@ class FakeServer:
                 break
             elif not authed:
                 send("480 auth required")
+            elif up.startswith("XFEATURE COMPRESS GZIP"):
+                if self.compression:
+                    compress = True
+                    send("290 feature enabled")
+                else:
+                    send("500 unknown command")
             elif up == "MODE READER":
                 send("200 posting ok")
             elif up == "DATE":
@@ -96,13 +106,20 @@ class FakeServer:
                 send("400 Unrecognized command")
             elif up.startswith(("OVER", "XOVER")):
                 lo, hi = (int(x) for x in cmd.split()[1].split("-"))
+                self.over_calls += 1
                 send("224 overview")
                 out = []
                 for num, h, body in self.groups.get(group, []):
                     if lo <= num <= hi:
                         out.append("\t".join([str(num), h["Subject"], h["From"], h["Date"], h["Message-ID"],
                                               h["References"], str(len(body)), str(body.count(b"\r\n") + 1)]))
-                send_block("\r\n".join(out).encode())
+                if compress:
+                    block = "\r\n".join(out).encode()
+                    stuffed = b"".join((b"." + l if l.startswith(b".") else l) + b"\r\n"
+                                       for l in (block.split(b"\r\n") if block else [])) + b".\r\n"
+                    w.write(zlib.compress(stuffed) + b".\r\n")
+                else:
+                    send_block("\r\n".join(out).encode())
             elif up.startswith(("BODY", "ARTICLE", "STAT")):
                 mid = cmd.split()[1]
                 if mid not in self.by_id or mid in self.missing:

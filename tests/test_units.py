@@ -42,3 +42,33 @@ def test_fts_query_sanitises():
     assert GroupService.fts_query('foo "bar baz" -qux') == '"foo"* AND "bar baz" NOT "qux"'
     assert GroupService.fts_query('-only') is None
     assert GroupService.fts_query('a"b') == '"a"* AND "b"*'
+
+
+def test_upgrade_from_v1_0_database(tmp_path):
+    """A 1.0.x database (article-level FTS, no files/releases tables) is migrated and indexed."""
+    import sqlite3
+    from app.db import DB
+    path = str(tmp_path / "old.db")
+    c = sqlite3.connect(path)
+    c.executescript("""
+    CREATE TABLE articles(id INTEGER PRIMARY KEY, grp TEXT NOT NULL, num INTEGER NOT NULL, subject TEXT, poster TEXT,
+      date INTEGER, msgid TEXT, parent TEXT, bytes INTEGER, lines INTEGER, file_key TEXT, release_key TEXT,
+      part INTEGER, total INTEGER, filename TEXT, is_read INTEGER DEFAULT 0, UNIQUE(grp, num));
+    CREATE VIRTUAL TABLE articles_fts USING fts5(subject, poster, content='articles', content_rowid='id');
+    CREATE TRIGGER art_ai AFTER INSERT ON articles BEGIN
+      INSERT INTO articles_fts(rowid, subject, poster) VALUES (new.id, new.subject, new.poster); END;
+    """)
+    for i in range(1, 7):
+        fk, rk, part, total, fn = subjects.parse_subject(f'[1/2] - "Old.Release.part{(i - 1) // 3 + 1}.rar" yEnc ({(i - 1) % 3 + 1}/3)')
+        c.execute("INSERT INTO articles(grp,num,subject,poster,date,msgid,bytes,file_key,release_key,part,total,filename) "
+                  "VALUES('g',?,?,?,?,?,?,?,?,?,?,?)", (i, "s", "p", 100, f"<{i}>", 10, fk, rk, part, total, fn))
+    c.commit()
+    c.close()
+    d = DB(path)
+    assert d.needs_rebuild
+    d.rebuild()
+    rel = d.q("SELECT release_key, files, parts, expected, size FROM releases")
+    assert rel == [{"release_key": "Old.Release", "files": 2, "parts": 6, "expected": 6, "size": 60}]
+    assert not d.q("SELECT name FROM sqlite_master WHERE name='articles_fts'")
+    # new inserts work without the old trigger
+    d.ingest("g", [("g", 99, "x", "p", 1, "<99>", "", 5, 1, "x", "x", 1, 1, "")])

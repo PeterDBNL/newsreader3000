@@ -7,10 +7,13 @@ import email.utils
 import logging
 import ssl as ssllib
 import time
+import zlib
 
 log = logging.getLogger("nntp")
 # Hosts known to reject OVER (we then use the older XOVER for every connection to them)
 _XOVER_HOSTS = set()
+# Hosts where compressed headers failed or were refused
+_NO_COMPRESS = set()
 CONN_ERRORS = (ConnectionError, OSError, asyncio.TimeoutError, asyncio.IncompleteReadError,
                asyncio.LimitOverrunError, EOFError)
 
@@ -31,7 +34,9 @@ class NNTPConnection:
         self.current_group = None
         self.last_used = time.time()
         self.can_post = False
-        self._over_cmd = "XOVER" if host in _XOVER_HOSTS else "OVER"
+        self.key = f"{host}:{self.port}"
+        self._over_cmd = "XOVER" if self.key in _XOVER_HOSTS else "OVER"
+        self.compressed = None  # None = not negotiated yet
 
     async def connect(self):
         ctx = None
@@ -89,17 +94,55 @@ class NNTPConnection:
             raise NNTPError(code, msg)
         return code, msg
 
-    async def _multiline(self):
-        first = await self._readline()
+    async def _multiline(self, prefix=b""):
+        first = prefix + await self._readline() if prefix[-1:] != b"\n" else prefix
         if first == b".\r\n":
             return b""
         data = bytearray(first)
         while not data.endswith(b"\r\n.\r\n"):
             data += await asyncio.wait_for(self.reader.readuntil(b".\r\n"), self.timeout)
-        data = bytes(data[:-3])
-        if data.startswith(b".."):
-            data = data[1:]
-        return data.replace(b"\r\n..", b"\r\n.")
+        return _unstuff(bytes(data[:-3]))
+
+    async def enable_compression(self):
+        """Ask for gzip-compressed header listings (XFEATURE COMPRESS GZIP, offered by many big providers).
+        Headers then travel 3-5x smaller. Silently stays off when the server doesn't support it."""
+        if self.compressed is not None:
+            return self.compressed
+        self.compressed = False
+        if self.key in _NO_COMPRESS:
+            return False
+        try:
+            code, _ = await self.cmd("XFEATURE COMPRESS GZIP TERMINATOR")
+            self.compressed = code == 290
+        except NNTPError:
+            pass
+        if not self.compressed:
+            _NO_COMPRESS.add(self.key)
+        return self.compressed
+
+    async def _compressed_block(self):
+        head = await asyncio.wait_for(self.reader.readexactly(2), self.timeout)
+        if not (head[0] == 0x78 or head == b"\x1f\x8b"):
+            return await self._multiline(head)  # server chose to answer uncompressed
+        d = zlib.decompressobj(47)  # accepts zlib or gzip framing
+        out = [d.decompress(head)]
+        while not d.eof:
+            chunk = await asyncio.wait_for(self.reader.read(1 << 16), self.timeout)
+            if not chunk:
+                raise ConnectionError("Server closed the connection")
+            out.append(d.decompress(chunk))
+        rest = d.unused_data
+        while len(rest) < 3:
+            more = await asyncio.wait_for(self.reader.read(3 - len(rest)), self.timeout)
+            if not more:
+                raise ConnectionError("Server closed the connection")
+            rest += more
+        if rest != b".\r\n":
+            raise ConnectionError("Unexpected data after compressed block")
+        text = b"".join(out)
+        if text == b".\r\n" or text.endswith(b"\r\n.\r\n"):
+            text = text[:-3]
+        return _unstuff(text)
 
     async def group(self, name):
         _, msg = await self.cmd(f"GROUP {name}")
@@ -107,26 +150,37 @@ class NNTPConnection:
         self.current_group = name
         return {"count": int(parts[0]), "first": int(parts[1]), "last": int(parts[2])}
 
-    async def over(self, first, last):
+    async def over_raw(self, first, last):
+        """Overview lines for an article range as raw bytes (parse with parse_over_data)."""
         try:
             await self.cmd(f"{self._over_cmd} {first}-{last}")
         except NNTPError as e:
             # Some providers answer OVER with "400/500/501 Unrecognized command"; they support XOVER.
             if e.code in (400, 500, 501) and self._over_cmd == "OVER":
                 self._over_cmd = "XOVER"
-                _XOVER_HOSTS.add(self.host)
+                _XOVER_HOSTS.add(self.key)
                 try:
                     await self.cmd(f"XOVER {first}-{last}")
                 except NNTPError as e2:
                     if e2.code == 423:
-                        return []
+                        return b""
                     raise
             elif e.code == 423:
-                return []
+                return b""
             else:
                 raise
-        data = await self._multiline()
-        return [parse_over_line(l) for l in data.split(b"\r\n") if l]
+        if not self.compressed:
+            return await self._multiline()
+        try:
+            return await self._compressed_block()
+        except (zlib.error, ConnectionError, asyncio.IncompleteReadError) as e:
+            log.warning("%s: compressed headers failed (%s); using plain headers from now on", self.host, e)
+            _NO_COMPRESS.add(self.key)
+            self.close()
+            raise ConnectionError("compressed header transfer failed")
+
+    async def over(self, first, last):
+        return parse_over_data(await self.over_raw(first, last))
 
     async def body(self, msgid):
         await self.cmd(f"BODY {fmt_id(msgid)}")
@@ -187,6 +241,16 @@ class NNTPConnection:
             if self.writer:
                 self.writer.close()
         self.writer = None
+
+
+def _unstuff(data: bytes):
+    if data.startswith(b".."):
+        data = data[1:]
+    return data.replace(b"\r\n..", b"\r\n.")
+
+
+def parse_over_data(data: bytes):
+    return [parse_over_line(l) for l in data.split(b"\r\n") if l]
 
 
 def fmt_id(msgid):

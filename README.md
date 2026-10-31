@@ -11,19 +11,25 @@ Connect it to your provider (for example Eweka), then browse, search, read and d
 - About 20 popular binary groups are subscribed on first start, so search works straight away. Add any other group by name
 - Download headers per group: the newest N first, then **Older…** to go further back. You can also update all subscribed groups at once or on a schedule
 - Optional header retention (delete stored headers older than X days)
+- **Header log**: every header download is recorded (group, article range, headers received/new, time, speed, compressed or not, errors). It is shown per group on the Browse page and for all groups on the Groups page
+- **Fast header downloads**:
+  - compressed transfer (`XFEATURE COMPRESS GZIP`) when the server supports it, which moves 3–5× less data
+  - several connections in parallel
+  - parsing and storage run in the background, so the web page stays responsive during big fetches
 
 **Browse and read**
 - Three views per group:
   - **Releases**: multi-file posts grouped together, with a completeness %, file count, and par2/nfo markers
   - **Files**: each file on its own, with its parts
   - **Articles**: raw posts, for text/discussion groups
+- Click or Shift-click rows to select a range of releases
 - Filter by words (`-word` excludes a word), minimum size and maximum age. Sort by date, size or name. Read/unread tracking with a "hide read" option and "mark all read"
 - Article viewer with headers, text (quotes dimmed, links clickable), thread view, inline images for yEnc/MIME/UU attachments, and attachment downloads
 - **Preview** files inside a release without downloading the whole thing: images, NFOs (DOS art shown correctly), text, PDF, audio, short video (up to 64 MB)
 - **Post** new messages and replies to text groups
 
 **Search**
-- Full-text search (SQLite FTS5) over the headers of all subscribed groups, or only the ones you pick
+- Full-text search over releases from all subscribed groups, or only the ones you pick. Releases and files are precomputed while headers arrive, so browsing and searching never have to regroup millions of articles
 - Supports `"exact phrase"`, `-exclude`, prefix matching, size range, age, poster, and Release/File/Article views
 
 **Downloads**

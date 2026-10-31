@@ -23,7 +23,7 @@ from .nntp import CONN_ERRORS, NNTPConnection, NNTPError, Pools
 from .reader import Reader
 from .tasks import Tasks
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 logging.basicConfig(level=os.environ.get("NR_LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("app")
@@ -73,6 +73,12 @@ async def lifespan(app):
     if not hasattr(S, "settings"):
         init()
     S.downloader = Downloader(S.db, S.settings, S.pools, S.settings.config_dir)
+    if S.db.needs_rebuild:
+        async def rebuild(t):
+            t["message"] = "Indexing stored headers into releases (one-time upgrade)..."
+            await asyncio.to_thread(S.db.rebuild)
+            t["message"] = "Done"
+        S.tasks.start("upgrade", "Upgrade header index", rebuild)
     S.downloader.start()
     sched = asyncio.get_running_loop().create_task(scheduler())
     yield
@@ -189,7 +195,24 @@ async def refresh_groups():
 
 @app.get("/api/groups")
 async def list_groups(q: str = "", subscribed: int = -1, offset: int = 0, limit: int = 100, sort: str = "name"):
-    return S.groups.list_groups(q, None if subscribed < 0 else bool(subscribed), offset, min(limit, 1000), sort)
+    return await asyncio.to_thread(S.groups.list_groups, q, None if subscribed < 0 else bool(subscribed), offset,
+                                   min(limit, 1000), sort)
+
+
+@app.get("/api/groups/info")
+async def group_info(name: str):
+    return await asyncio.to_thread(S.groups.group_info, name)
+
+
+@app.get("/api/headers/log")
+async def header_log(group: str = "", limit: int = 100):
+    return S.groups.fetch_log(group or None, min(limit, 1000))
+
+
+@app.post("/api/headers/log/clear")
+async def clear_header_log():
+    S.db.x("DELETE FROM fetch_log WHERE status != 'running'")
+    return {"ok": True}
 
 
 @app.post("/api/groups/subscribe")
@@ -217,13 +240,14 @@ async def update_all():
 
 @app.post("/api/groups/mark-read")
 async def mark_read(data: dict = Body(...)):
-    S.groups.mark_read(data.get("name"), data.get("read", True), data.get("ids"))
+    await asyncio.to_thread(S.groups.mark_read, data.get("name"), data.get("read", True), data.get("ids"),
+                            data.get("releases"))
     return {"ok": True}
 
 
 @app.post("/api/groups/clear")
 async def clear_group(data: dict = Body(...)):
-    S.groups.delete_headers(data["name"])
+    await asyncio.to_thread(S.groups.delete_headers, data["name"])
     return {"ok": True}
 
 
@@ -238,7 +262,8 @@ def _q(group, groups, q, mode, offset, limit, min_size, max_size, max_age, poste
 @app.get("/api/browse")
 async def browse(group: str, q: str = "", mode: str = "releases", offset: int = 0, limit: int = 100, min_size: float = 0,
            max_size: float = 0, max_age: float = 0, poster: str = "", hide_read: int = 0, sort: str = "date"):
-    return _q(group, None, q, mode, offset, limit, min_size, max_size, max_age, poster, hide_read, sort)
+    return await asyncio.to_thread(_q, group, None, q, mode, offset, limit, min_size, max_size, max_age, poster,
+                                   hide_read, sort)
 
 
 @app.get("/api/search")
@@ -246,17 +271,14 @@ async def search(q: str = "", groups: str = "", mode: str = "releases", offset: 
            min_size: float = 0, max_size: float = 0, max_age: float = 0, poster: str = "", sort: str = "date"):
     if not q.strip() and not poster:
         raise HTTPException(400, "Enter something to search for")
-    return _q(None, groups, q, mode, offset, limit, min_size, max_size, max_age, poster, 0, sort)
+    return await asyncio.to_thread(_q, None, groups, q, mode, offset, limit, min_size, max_size, max_age, poster, 0,
+                                   sort)
 
 
 @app.get("/api/release")
 async def release_files(group: str, key: str, kind: str = "release"):
     """List the files inside a release (or the parts of a file)."""
-    col = "release_key" if kind == "release" else "file_key"
-    rows = S.db.q(f"SELECT file_key k, MIN(subject) subject, MAX(filename) filename, SUM(bytes) size, "
-                  f"COUNT(*) parts, MAX(total) expected, MAX(date) date FROM articles WHERE grp=? AND {col}=? "
-                  f"GROUP BY file_key ORDER BY filename, subject", (group, key))
-    return rows
+    return await asyncio.to_thread(S.groups.release_files, group, key, kind)
 
 
 @app.get("/api/thread")
@@ -320,7 +342,7 @@ async def post_article(data: dict = Body(...)):
 # ------------------------------------------------------------------ NZB & downloads
 @app.post("/api/nzb")
 async def make_nzb(data: dict = Body(...)):
-    files = S.groups.collect(data.get("items", []))
+    files = await asyncio.to_thread(S.groups.collect, data.get("items", []))
     if not files:
         raise HTTPException(400, "Nothing selected")
     name = data.get("name") or "selection"
@@ -339,7 +361,7 @@ async def download_selection(data: dict = Body(...)):
     else:
         groups = [items]
     for g in groups:
-        files = S.groups.collect(g)
+        files = await asyncio.to_thread(S.groups.collect, g)
         if not files:
             continue
         name = data.get("name") if len(groups) == 1 and data.get("name") else (g[0].get("name") or files[0]["subject"])

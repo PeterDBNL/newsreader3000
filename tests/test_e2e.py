@@ -2,6 +2,7 @@ import asyncio
 import os
 
 import httpx
+import pytest
 
 from tests.fake_nntp import FakeServer, make_zip
 
@@ -135,9 +136,12 @@ async def test_status_endpoint(tmp_path):
             assert (await c.get("/")).status_code == 200
 
 
-async def test_server_without_over_command(tmp_path):
+@pytest.mark.parametrize("compression", [False, True])
+async def test_server_without_over_command(tmp_path, compression):
     srv = FakeServer()
     srv.reject_over = True
+    srv.compression = compression
+    srv.add("alt.binaries.cores", ".starts with a dot", b"x")
     srv.add_binary("alt.binaries.cores", "Some.App.zip", os.urandom(9000))
     await srv.start()
     from app import main as m
@@ -149,5 +153,11 @@ async def test_server_without_over_command(tmp_path):
             await c.post("/api/groups/subscribe", json={"names": ["alt.binaries.cores"], "fetch": True})
             await wait_tasks(c)
             r = (await c.get("/api/browse", params={"group": "alt.binaries.cores", "mode": "files"})).json()
-            assert r["total"] == 1
+            assert r["total"] == 2
+            assert ".starts with a dot" in [i["subject"] for i in r["items"]]
+            log = (await c.get("/api/headers/log", params={"group": "alt.binaries.cores"})).json()
+            assert log[0]["status"] == "done" and log[0]["received"] == 4
+            assert log[0]["compressed"] == int(compression)
+            info = (await c.get("/api/groups/info", params={"name": "alt.binaries.cores"})).json()
+            assert info["releases"] == 2 and info["files"] == 2
     await srv.stop()

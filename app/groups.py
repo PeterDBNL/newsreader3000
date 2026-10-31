@@ -4,6 +4,8 @@ import logging
 import re
 import time
 
+from .nntp import parse_over_data
+
 from .subjects import parse_subject
 
 log = logging.getLogger("groups")
@@ -56,7 +58,7 @@ class GroupService:
             r["count"] = max(0, (r["high"] or 0) - (r["low"] or 0) + 1) if r["high"] else 0
         if subscribed:
             stats = {r["grp"]: r for r in self.db.q(
-                "SELECT grp, COUNT(*) n, SUM(is_read=0) unread FROM articles GROUP BY grp")}
+                "SELECT grp, COUNT(*) n, SUM(is_read=0) unread FROM releases GROUP BY grp")}
             for r in rows:
                 s = stats.get(r["name"], {})
                 r["stored"] = s.get("n", 0)
@@ -67,14 +69,37 @@ class GroupService:
         self.db.subscribe(names, on)
 
     def delete_headers(self, group):
-        self.db.x("DELETE FROM articles WHERE grp=?", (group,))
+        for t in ("articles", "files", "releases"):
+            self.db.x(f"DELETE FROM {t} WHERE grp=?", (group,))
         self.db.x("UPDATE groups SET first_fetched=0, last_fetched=0 WHERE name=?", (group,))
 
-    def mark_read(self, group, read=True, ids=None):
+    def mark_read(self, group, read=True, ids=None, releases=None):
+        v = 1 if read else 0
         if ids:
-            self.db.many("UPDATE articles SET is_read=? WHERE id=?", [(1 if read else 0, i) for i in ids])
-        else:
-            self.db.x("UPDATE articles SET is_read=? WHERE grp=?", (1 if read else 0, group))
+            self.db.many("UPDATE articles SET is_read=? WHERE id=?", [(v, i) for i in ids])
+        if releases:
+            self.db.many("UPDATE releases SET is_read=? WHERE grp=? AND release_key=?",
+                         [(v, r["grp"], r["key"]) for r in releases])
+        if group and not ids and not releases:
+            self.db.x("UPDATE articles SET is_read=? WHERE grp=?", (v, group))
+            self.db.x("UPDATE releases SET is_read=? WHERE grp=?", (v, group))
+
+    def group_info(self, group):
+        g = self.db.one("SELECT * FROM groups WHERE name=?", (group,)) or {"name": group}
+        st = self.db.one("SELECT COUNT(*) releases, MIN(date) oldest, MAX(date) newest, SUM(is_read=0) unread "
+                         "FROM releases WHERE grp=?", (group,))
+        g.update(st or {})
+        g["files"] = self.db.one("SELECT COUNT(*) n FROM files WHERE grp=?", (group,))["n"]
+        g["stored_articles"] = (g.get("last_fetched") or 0) - (g.get("first_fetched") or 0) + 1 \
+            if g.get("last_fetched") else 0
+        g["available"] = max(0, (g.get("high") or 0) - (g.get("low") or 0) + 1) if g.get("high") else 0
+        g["log"] = self.fetch_log(group, 10)
+        return g
+
+    def fetch_log(self, group=None, limit=100):
+        if group:
+            return self.db.q("SELECT * FROM fetch_log WHERE grp=? ORDER BY id DESC LIMIT ?", (group, limit))
+        return self.db.q("SELECT * FROM fetch_log ORDER BY id DESC LIMIT ?", (limit,))
 
     # ---------- headers ----------
     def fetch_headers(self, group, mode="new", count=None):
@@ -84,63 +109,94 @@ class GroupService:
             await self._fetch(group, mode, count, t)
         return self.tasks.start("headers", label, job)
 
+    def _ingest(self, group, raw):
+        """Parse raw overview data and store it (runs in a worker thread)."""
+        rows = []
+        for it in parse_over_data(raw):
+            fk, rk, part, total, fname = parse_subject(it["subject"])
+            rows.append((group, it["num"], it["subject"], it["poster"], it["date"], it["msgid"],
+                         it["parent"], it["bytes"], it["lines"], fk, rk, part, total, fname))
+        return len(rows), (self.db.ingest(group, rows) if rows else 0)
+
     async def _fetch(self, group, mode, count, t):
         cfg = self.settings.get("headers")
         count = int(count or cfg.get("initial_fetch", 20000))
         batch = max(100, int(cfg.get("batch_size", 5000)))
+        compress = bool(cfg.get("compression", True))
         pool = self.pools.reader()
-        info = await pool.run(lambda c: c.group(group))
-        first, last = info["first"], info["last"]
-        g = self.db.one("SELECT * FROM groups WHERE name=?", (group,)) or {}
-        self.db.x("INSERT INTO groups(name, low, high) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET low=?, high=?",
-                  (group, first, last, first, last))
-        lf, ff = g.get("last_fetched") or 0, g.get("first_fetched") or 0
-        if mode == "older" and ff:
-            end = ff - 1
-            start = max(first, end - count + 1)
-        elif mode == "reset" or not lf:
-            start, end = max(first, last - count + 1), last
-            if mode == "reset":
-                self.delete_headers(group)
-            ff = 0
-        else:
-            start, end = max(lf + 1, first, last - max(count, 1) * 5 + 1), last
-        if end < start or last == 0:
-            t["message"] = "Up to date"
-            return
-        ranges = [(a, min(a + batch - 1, end)) for a in range(start, end + 1, batch)]
-        ranges.reverse()  # newest first so recent posts appear quickly
-        t["total"] = end - start + 1
-        t["message"] = f"Fetching {t['total']:,} headers"
-        q = asyncio.Queue()
-        for r in ranges:
-            q.put_nowait(r)
-        state = {"inserted": 0}
+        started = int(time.time())
+        log_id = self.db.x("INSERT INTO fetch_log(grp, mode, started, status) VALUES(?,?,?,?)",
+                           (group, mode, started, "running"))
+        t["log_id"] = log_id
+        state = {"received": 0, "inserted": 0, "compressed": False}
 
-        async def worker():
-            while not q.empty():
-                a, b = q.get_nowait()
+        def finish(status, msg, first=0, last=0, requested=0):
+            self.db.x("UPDATE fetch_log SET first=?, last=?, requested=?, received=?, inserted=?, finished=?, "
+                      "status=?, message=?, compressed=? WHERE id=?",
+                      (first, last, requested, state["received"], state["inserted"], int(time.time()), status, msg,
+                       int(state["compressed"]), log_id))
+        try:
+            info = await pool.run(lambda c: c.group(group))
+            first, last = info["first"], info["last"]
+            g = self.db.one("SELECT * FROM groups WHERE name=?", (group,)) or {}
+            self.db.x("INSERT INTO groups(name, low, high) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET "
+                      "low=excluded.low, high=excluded.high", (group, first, last))
+            lf, ff = g.get("last_fetched") or 0, g.get("first_fetched") or 0
+            if mode == "older" and ff:
+                end = ff - 1
+                start = max(first, end - count + 1)
+            elif mode == "reset" or not lf:
+                if mode == "reset":
+                    await asyncio.to_thread(self.delete_headers, group)
+                start, end = max(first, last - count + 1), last
+                ff = 0
+            else:
+                start, end = max(lf + 1, first, last - max(count, 1) * 5 + 1), last
+            if end < start or last == 0:
+                t["message"] = "Up to date"
+                finish("done", "Up to date")
+                return
+            ranges = [(a, min(a + batch - 1, end)) for a in range(start, end + 1, batch)]
+            ranges.reverse()  # newest first so recent posts appear quickly
+            t["total"] = end - start + 1
+            t["message"] = f"Fetching {t['total']:,} headers"
+            q = asyncio.Queue()
+            for r in ranges:
+                q.put_nowait(r)
+            t0 = time.time()
 
-                async def get(c):
-                    if c.current_group != group:
-                        await c.group(group)
-                    return await c.over(a, b)
-                items = await pool.run(get)
-                rows = []
-                for it in items:
-                    fk, rk, part, total, fname = parse_subject(it["subject"])
-                    rows.append((group, it["num"], it["subject"], it["poster"], it["date"], it["msgid"],
-                                 it["parent"], it["bytes"], it["lines"], fk, rk, part, total, fname))
-                if rows:
-                    self.db.insert_articles(rows)
-                state["inserted"] += len(rows)
-                t["progress"] += b - a + 1
-        workers = max(1, min(pool.max, len(ranges)))
-        await asyncio.gather(*[worker() for _ in range(workers)])
-        new_first = start if (not ff or start < ff) else ff
-        self.db.x("UPDATE groups SET first_fetched=?, last_fetched=MAX(last_fetched, ?), updated_at=? WHERE name=?",
-                  (new_first, end, int(time.time()), group))
-        t["message"] = f"{state['inserted']:,} new headers"
+            async def worker():
+                while not q.empty():
+                    a, b = q.get_nowait()
+
+                    async def get(c):
+                        if compress:
+                            state["compressed"] = await c.enable_compression() or state["compressed"]
+                        if c.current_group != group:
+                            await c.group(group)
+                        return await c.over_raw(a, b)
+                    raw = await pool.run(get)
+                    received, inserted = await asyncio.to_thread(self._ingest, group, raw)
+                    state["received"] += received
+                    state["inserted"] += inserted
+                    t["progress"] += b - a + 1
+                    rate = state["received"] / max(0.1, time.time() - t0)
+                    t["message"] = f"{state['received']:,} headers ({rate:,.0f}/s)" + \
+                        (" · compressed" if state["compressed"] else "")
+            workers = max(1, min(pool.max, len(ranges)))
+            await asyncio.gather(*[worker() for _ in range(workers)])
+            new_first = start if (not ff or start < ff) else ff
+            self.db.x("UPDATE groups SET first_fetched=?, last_fetched=MAX(last_fetched, ?), updated_at=? "
+                      "WHERE name=?", (new_first, end, int(time.time()), group))
+            secs = max(1, int(time.time()) - started)
+            t["message"] = f"{state['inserted']:,} new headers in {secs}s"
+            finish("done", t["message"], start, end, end - start + 1)
+        except asyncio.CancelledError:
+            finish("cancelled", "Cancelled")
+            raise
+        except Exception as e:
+            finish("error", str(e))
+            raise
 
     def update_subscribed(self):
         groups = [r["name"] for r in self.db.q("SELECT name FROM groups WHERE subscribed=1 ORDER BY name")]
@@ -152,12 +208,28 @@ class GroupService:
         days = int(self.settings.get("headers").get("retention_days") or 0)
         if days > 0:
             cutoff = int(time.time()) - days * 86400
+            groups = [r["grp"] for r in self.db.q("SELECT DISTINCT grp FROM releases WHERE date < ?", (cutoff,))]
             self.db.x("DELETE FROM articles WHERE date < ?", (cutoff,))
+            for g in groups:
+                self.db.rebuild(g)
 
     # ---------- querying ----------
     @staticmethod
-    def fts_query(q):
-        """Turn user input into a safe FTS5 query. Supports -exclude and "exact phrase"."""
+    def terms(q):
+        """Split a query into (include, exclude) word lists. Supports "exact phrase" and -exclude."""
+        inc, exc = [], []
+        for tok in re.findall(r'-?"[^"]+"|\S+', q or ""):
+            neg = tok.startswith("-") and len(tok) > 1
+            tok = tok.lstrip("-").strip('"')
+            parts = [tok] if " " in tok else re.findall(r"[\w\-]+", tok)
+            for p in parts:
+                if p:
+                    (exc if neg else inc).append(p)
+        return inc, exc
+
+    @classmethod
+    def fts_query(cls, q):
+        """Turn user input into a safe FTS5 query."""
         tokens = re.findall(r'-?"[^"]+"|\S+', q or "")
         inc, exc = [], []
         for tok in tokens:
@@ -177,15 +249,31 @@ class GroupService:
 
     def query(self, groups=None, q="", mode="releases", offset=0, limit=100, min_size=0, max_size=0,
               max_age_days=0, poster="", hide_read=False, sort="date"):
-        where, args = [], []
-        join = ""
-        fq = self.fts_query(q)
-        if q and not fq:
-            return {"total": 0, "items": []}
-        if fq:
-            join = "JOIN articles_fts f ON f.rowid = a.id"
-            where.append("articles_fts MATCH ?")
-            args.append(fq)
+        if mode == "articles":
+            t, size = "articles", "a.bytes"
+        elif mode == "files":
+            t, size = "files", "a.size"
+        else:
+            t, size = "releases", "a.size"
+        where, args, join = [], [], ""
+        if q:
+            if mode == "releases":
+                fq = self.fts_query(q)
+                if not fq:
+                    return {"total": 0, "items": []}
+                join = "JOIN releases_fts f ON f.rowid = a.id"
+                where.append("releases_fts MATCH ?")
+                args.append(fq)
+            else:
+                inc, exc = self.terms(q)
+                if not inc:
+                    return {"total": 0, "items": []}
+                for w in inc:
+                    where.append("a.subject LIKE ?")
+                    args.append(f"%{w}%")
+                for w in exc:
+                    where.append("a.subject NOT LIKE ?")
+                    args.append(f"%{w}%")
         if groups:
             where.append("a.grp IN (%s)" % ",".join("?" * len(groups)))
             args += list(groups)
@@ -195,46 +283,45 @@ class GroupService:
         if poster:
             where.append("a.poster LIKE ?")
             args.append(f"%{poster}%")
-        if hide_read:
+        if hide_read and mode != "files":
             where.append("a.is_read=0")
-        w = (" WHERE " + " AND ".join(where)) if where else ""
-        having = []
-        hargs = []
         if min_size:
-            having.append("size >= ?")
-            hargs.append(int(float(min_size) * 1024 * 1024))
+            where.append(f"{size} >= ?")
+            args.append(int(float(min_size) * 1024 * 1024))
         if max_size:
-            having.append("size <= ?")
-            hargs.append(int(float(max_size) * 1024 * 1024))
-        h = (" HAVING " + " AND ".join(having)) if having else ""
-        order = {"date": "date DESC", "size": "size DESC", "name": "subject COLLATE NOCASE",
-                 "oldest": "date ASC"}.get(sort, "date DESC")
-
+            where.append(f"{size} <= ?")
+            args.append(int(float(max_size) * 1024 * 1024))
+        w = (" WHERE " + " AND ".join(where)) if where else ""
+        order = {"date": "a.date DESC", "size": f"{size} DESC", "name": "a.subject COLLATE NOCASE",
+                 "oldest": "a.date ASC"}.get(sort, "a.date DESC")
+        base = f"FROM {t} a {join}{w}"
+        total = self.db.one(f"SELECT COUNT(*) n {base}", args)["n"]
         if mode == "articles":
-            if having:
-                w += (" AND " if w else " WHERE ") + " AND ".join(x.replace("size", "a.bytes") for x in having)
-                args += hargs
-            sql_base = f"FROM articles a {join}{w}"
-            total = self.db.one(f"SELECT COUNT(*) n {sql_base}", args)["n"]
             items = self.db.q(
                 f"SELECT a.id, a.grp, a.num, a.subject, a.poster, a.date, a.msgid, a.parent, a.bytes size, "
-                f"a.lines, a.is_read, a.part, a.total {sql_base} ORDER BY {order.replace('size', 'a.bytes')} "
-                f"LIMIT ? OFFSET ?", args + [limit, offset])
+                f"a.lines, a.is_read, a.part, a.total {base} ORDER BY {order} LIMIT ? OFFSET ?",
+                args + [limit, offset])
             return {"total": total, "items": items}
-
-        key = "file_key" if mode == "files" else "release_key"
-        inner = (f"SELECT a.grp, a.{key} k, MIN(a.subject) subject, MAX(a.poster) poster, MAX(a.date) date, "
-                 f"SUM(a.bytes) size, COUNT(*) parts, COUNT(DISTINCT a.file_key) files, "
-                 f"SUM(CASE WHEN a.part=1 THEN a.total ELSE 0 END) expected, MIN(a.is_read) is_read, "
-                 f"MAX(CASE WHEN a.filename LIKE '%.nfo' THEN a.file_key END) nfo, "
-                 f"SUM(CASE WHEN a.filename LIKE '%.par2' THEN 1 ELSE 0 END) par2 "
-                 f"FROM articles a {join}{w} GROUP BY a.grp, a.{key}{h}")
-        total = self.db.one(f"SELECT COUNT(*) n FROM ({inner})", args + hargs)["n"]
-        items = self.db.q(f"{inner} ORDER BY {order} LIMIT ? OFFSET ?", args + hargs + [limit, offset])
+        if mode == "files":
+            items = self.db.q(
+                f"SELECT a.grp, a.file_key k, a.file_key name, a.subject, a.filename, a.poster, a.date, a.size, "
+                f"a.parts, a.total expected, 1 files, 0 is_read, NULL nfo, 0 par2 {base} ORDER BY {order} "
+                f"LIMIT ? OFFSET ?", args + [limit, offset])
+        else:
+            items = self.db.q(
+                f"SELECT a.id, a.grp, a.release_key k, a.release_key name, a.subject, a.poster, a.date, a.size, "
+                f"a.parts, a.expected, a.files, a.is_read, a.nfo, a.par2 {base} ORDER BY {order} "
+                f"LIMIT ? OFFSET ?", args + [limit, offset])
         for it in items:
-            it["name"] = it["k"]
             it["complete"] = round(min(100.0, 100.0 * it["parts"] / it["expected"]), 1) if it["expected"] else None
         return {"total": total, "items": items}
+
+    def release_files(self, group, key, kind="release"):
+        if kind == "release":
+            return self.db.q("SELECT file_key k, subject, filename, size, parts, total expected, date FROM files "
+                             "WHERE grp=? AND release_key=? ORDER BY filename, subject", (group, key))
+        return self.db.q("SELECT file_key k, subject, filename, size, parts, total expected, date FROM files "
+                         "WHERE grp=? AND file_key=?", (group, key))
 
     def collect(self, selections):
         """selections: [{grp, kind: release|file|article, key?, id?}] -> NZB-style file list."""
@@ -243,9 +330,15 @@ class GroupService:
             kind = s.get("kind")
             if kind == "article":
                 rows += self.db.q("SELECT * FROM articles WHERE id=?", (int(s["id"]),))
-            elif kind in ("file", "release"):
-                col = "file_key" if kind == "file" else "release_key"
-                rows += self.db.q(f"SELECT * FROM articles WHERE grp=? AND {col}=?", (s["grp"], s["key"]))
+            elif kind == "file":
+                rows += self.db.q("SELECT * FROM articles WHERE grp=? AND file_key=?", (s["grp"], s["key"]))
+            elif kind == "release":
+                fks = [r["file_key"] for r in self.db.q(
+                    "SELECT file_key FROM files WHERE grp=? AND release_key=?", (s["grp"], s["key"]))]
+                for i in range(0, len(fks), 400):
+                    ks = fks[i:i + 400]
+                    rows += self.db.q(f"SELECT * FROM articles WHERE grp=? AND file_key IN "
+                                      f"({','.join('?' * len(ks))})", [s["grp"]] + ks)
         files = {}
         seen = set()
         for r in rows:

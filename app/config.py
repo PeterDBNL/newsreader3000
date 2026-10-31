@@ -59,6 +59,7 @@ DEFAULTS = {
         "auto_update_minutes": 0,
         "retention_days": 0,
         "fetch_descriptions": False,
+        "compression": True,
     },
     "posting": {"from_name": "", "from_email": "", "organization": ""},
     "default_groups": DEFAULT_GROUPS,
