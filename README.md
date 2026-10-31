@@ -64,6 +64,18 @@ Connect it to your provider (for example Eweka), then browse, search, read and d
 
 Browsing and header downloads use a few connections of their own (Settings → *Connections for browsing / headers*, default 4). Downloads use the rest, so the total never goes over the server's connection limit.
 
+## Publishing to Docker Hub
+
+The **CI** workflow pushes to Docker Hub as well as ghcr.io once two repository secrets exist. Without them it skips Docker Hub.
+
+1. On hub.docker.com, go to **Account settings → Personal access tokens**, then create a token with *Read & Write* access.
+2. On GitHub, open this repo's **Settings → Secrets and variables → Actions** and add:
+   - `DOCKERHUB_USERNAME`: your Docker Hub username
+   - `DOCKERHUB_TOKEN`: the token from step 1
+3. Push a tag such as `v1.0.0`. The image appears as `<your-username>/newsreader3000:latest` and `:1.0.0`. Docker Hub repos are public by default.
+
+On Unraid, put `<your-username>/newsreader3000:latest` in the template's *Repository* field. Docker Hub images need no login when they are public.
+
 ## Docker Compose
 
 ```bash

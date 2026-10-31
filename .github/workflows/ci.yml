@@ -31,23 +31,40 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v6
-      - name: Image name and tags
+      - name: Image names and tags
         id: meta
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
-          IMAGE="ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/newsreader3000"
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/v}"
-            echo "tags=$IMAGE:$VERSION,$IMAGE:latest" >> "$GITHUB_OUTPUT"
-          else
-            echo "tags=$IMAGE:dev" >> "$GITHUB_OUTPUT"
+          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          IMAGES="ghcr.io/$OWNER/newsreader3000"
+          # Docker Hub is used only when the DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets are set
+          if [ -n "$DOCKERHUB_USERNAME" ]; then
+            IMAGES="$IMAGES docker.io/$(echo "$DOCKERHUB_USERNAME" | tr '[:upper:]' '[:lower:]')/newsreader3000"
+            echo "dockerhub=true" >> "$GITHUB_OUTPUT"
           fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSIONS="${GITHUB_REF#refs/tags/v} latest"
+          else
+            VERSIONS="dev"
+          fi
+          TAGS=""
+          for i in $IMAGES; do for v in $VERSIONS; do TAGS="$TAGS,$i:$v"; done; done
+          echo "tags=${TAGS#,}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to Docker Hub
+        if: steps.meta.outputs.dockerhub == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - uses: docker/build-push-action@v6
         with:
           context: .
