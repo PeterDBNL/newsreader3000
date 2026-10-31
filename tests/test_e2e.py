@@ -133,3 +133,21 @@ async def test_status_endpoint(tmp_path):
             assert s["download"]["queue"] == 0 and s["configured"] is False
             assert (await c.get("/api/queue")).status_code == 200
             assert (await c.get("/")).status_code == 200
+
+
+async def test_server_without_over_command(tmp_path):
+    srv = FakeServer()
+    srv.reject_over = True
+    srv.add_binary("alt.binaries.cores", "Some.App.zip", os.urandom(9000))
+    await srv.start()
+    from app import main as m
+    m.init(str(tmp_path / "config4"))
+    m.S.settings.update({"servers": [{"name": "x", "host": "127.0.0.1", "port": srv.port, "ssl": False,
+                                      "username": "u", "password": "p", "connections": 4}]})
+    async with m.app.router.lifespan_context(m.app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=m.app), base_url="http://t") as c:
+            await c.post("/api/groups/subscribe", json={"names": ["alt.binaries.cores"], "fetch": True})
+            await wait_tasks(c)
+            r = (await c.get("/api/browse", params={"group": "alt.binaries.cores", "mode": "files"})).json()
+            assert r["total"] == 1
+    await srv.stop()

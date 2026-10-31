@@ -9,6 +9,8 @@ import ssl as ssllib
 import time
 
 log = logging.getLogger("nntp")
+# Hosts known to reject OVER (we then use the older XOVER for every connection to them)
+_XOVER_HOSTS = set()
 CONN_ERRORS = (ConnectionError, OSError, asyncio.TimeoutError, asyncio.IncompleteReadError,
                asyncio.LimitOverrunError, EOFError)
 
@@ -29,7 +31,7 @@ class NNTPConnection:
         self.current_group = None
         self.last_used = time.time()
         self.can_post = False
-        self._over_cmd = "OVER"
+        self._over_cmd = "XOVER" if host in _XOVER_HOSTS else "OVER"
 
     async def connect(self):
         ctx = None
@@ -109,9 +111,16 @@ class NNTPConnection:
         try:
             await self.cmd(f"{self._over_cmd} {first}-{last}")
         except NNTPError as e:
-            if e.code == 500 and self._over_cmd == "OVER":
+            # Some providers answer OVER with "400/500/501 Unrecognized command"; they support XOVER.
+            if e.code in (400, 500, 501) and self._over_cmd == "OVER":
                 self._over_cmd = "XOVER"
-                await self.cmd(f"XOVER {first}-{last}")
+                _XOVER_HOSTS.add(self.host)
+                try:
+                    await self.cmd(f"XOVER {first}-{last}")
+                except NNTPError as e2:
+                    if e2.code == 423:
+                        return []
+                    raise
             elif e.code == 423:
                 return []
             else:
@@ -248,8 +257,8 @@ class ServerPool:
             try:
                 yield conn
                 ok = True
-            except NNTPError:
-                ok = True
+            except NNTPError as e:
+                ok = e.code != 400  # 400 means the server may drop this connection
                 raise
             finally:
                 if ok and not self.closed:

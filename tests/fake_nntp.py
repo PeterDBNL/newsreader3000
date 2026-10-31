@@ -15,6 +15,7 @@ class FakeServer:
         self.by_id = {}
         self.posted = []
         self.missing = set()
+        self.reject_over = False  # mimic providers that only know XOVER
 
     def add(self, group, subject, body: bytes, poster="Tester <t@example.com>", msgid=None, refs=""):
         arts = self.groups.setdefault(group, [])
@@ -91,6 +92,8 @@ class FakeServer:
                     send("411 no such group")
                 else:
                     send(f"211 {len(a)} 1 {len(a)} {group}")
+            elif up.startswith("OVER") and self.reject_over:
+                send("400 Unrecognized command")
             elif up.startswith(("OVER", "XOVER")):
                 lo, hi = (int(x) for x in cmd.split()[1].split("-"))
                 send("224 overview")
