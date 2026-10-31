@@ -8,6 +8,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish, e.g. 1.0.0 (also tags latest). Leave empty for a dev build.'
+        required: false
+        default: ''
 
 jobs:
   test:
@@ -35,6 +40,7 @@ jobs:
         id: meta
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
           IMAGES="ghcr.io/$OWNER/newsreader3000"
@@ -45,6 +51,8 @@ jobs:
           fi
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             VERSIONS="${GITHUB_REF#refs/tags/v} latest"
+          elif [[ "$INPUT_VERSION" =~ ^[0-9][0-9A-Za-z.+-]*$ ]]; then
+            VERSIONS="$INPUT_VERSION latest"
           else
             VERSIONS="dev"
           fi
