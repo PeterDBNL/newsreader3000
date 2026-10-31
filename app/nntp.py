@@ -14,6 +14,7 @@ log = logging.getLogger("nntp")
 _XOVER_HOSTS = set()
 # Hosts where compressed headers failed or were refused
 _NO_COMPRESS = set()
+COMPRESS_STALL_TIMEOUT = 15  # seconds without data before giving up on compressed headers
 CONN_ERRORS = (ConnectionError, OSError, asyncio.TimeoutError, asyncio.IncompleteReadError,
                asyncio.LimitOverrunError, EOFError)
 
@@ -37,6 +38,8 @@ class NNTPConnection:
         self.key = f"{host}:{self.port}"
         self._over_cmd = "XOVER" if self.key in _XOVER_HOSTS else "OVER"
         self.compressed = None  # None = not negotiated yet
+        self.last_compressed = False  # was the last header listing actually compressed?
+        self.broken = False  # set when the protocol state is uncertain; the pool then drops the connection
 
     async def connect(self):
         ctx = None
@@ -112,7 +115,7 @@ class NNTPConnection:
         if self.key in _NO_COMPRESS:
             return False
         try:
-            code, _ = await self.cmd("XFEATURE COMPRESS GZIP TERMINATOR")
+            code, _ = await self.cmd("XFEATURE COMPRESS GZIP")
             self.compressed = code == 290
         except NNTPError:
             pass
@@ -121,26 +124,60 @@ class NNTPConnection:
         return self.compressed
 
     async def _compressed_block(self):
+        """Read a compressed header listing. Providers differ in the details: the end-of-list marker
+        ".\r\n" can be inside the compressed data, after it, or both, and the compressed stream is not
+        always properly closed. Anything unexpected raises, and the caller falls back to plain headers."""
+        stall = COMPRESS_STALL_TIMEOUT
         head = await asyncio.wait_for(self.reader.readexactly(2), self.timeout)
         if not (head[0] == 0x78 or head == b"\x1f\x8b"):
-            return await self._multiline(head)  # server chose to answer uncompressed
+            self.last_compressed = False
+            return await self._multiline(head)  # server answered uncompressed after all
+        self.last_compressed = True
         d = zlib.decompressobj(47)  # accepts zlib or gzip framing
-        out = [d.decompress(head)]
-        while not d.eof:
-            chunk = await asyncio.wait_for(self.reader.read(1 << 16), self.timeout)
+        buf = bytearray(d.decompress(head))
+
+        def complete():
+            return buf == b".\r\n" or buf.endswith(b"\r\n.\r\n")
+        while not complete() and not d.eof:
+            chunk = await asyncio.wait_for(self.reader.read(1 << 16), stall)
             if not chunk:
                 raise ConnectionError("Server closed the connection")
-            out.append(d.decompress(chunk))
-        rest = d.unused_data
-        while len(rest) < 3:
-            more = await asyncio.wait_for(self.reader.read(3 - len(rest)), self.timeout)
-            if not more:
-                raise ConnectionError("Server closed the connection")
-            rest += more
-        if rest != b".\r\n":
-            raise ConnectionError("Unexpected data after compressed block")
-        text = b"".join(out)
-        if text == b".\r\n" or text.endswith(b"\r\n.\r\n"):
+            buf += d.decompress(chunk)
+        if not d.eof:
+            # End marker seen but the compressed stream may still have a few closing bytes.
+            with contextlib.suppress(asyncio.TimeoutError, TimeoutError):
+                while not d.eof:
+                    chunk = await asyncio.wait_for(self.reader.read(1 << 16), 0.3)
+                    if not chunk:
+                        break
+                    try:
+                        buf += d.decompress(chunk)
+                    except zlib.error:  # e.g. a plain end marker after an unfinished stream
+                        break
+        rest = d.unused_data if d.eof else b""
+        if not complete():
+            # marker must follow the compressed data
+            while len(rest) < 3:
+                more = await asyncio.wait_for(self.reader.read(3 - len(rest)), stall)
+                if not more:
+                    raise ConnectionError("Server closed the connection")
+                rest += more
+            if rest != b".\r\n":
+                raise ConnectionError("Unexpected data after compressed headers")
+        elif d.eof and rest not in (b".\r\n",):
+            # marker was inside; some servers send it once more outside
+            with contextlib.suppress(asyncio.TimeoutError, TimeoutError):
+                while len(rest) < 3 and b".\r\n".startswith(rest):
+                    more = await asyncio.wait_for(self.reader.read(3 - len(rest)), 0.2)
+                    if not more:
+                        break
+                    rest += more
+            if rest not in (b"", b".\r\n"):
+                self.broken = True
+        elif not d.eof:
+            self.broken = True  # can't be sure the stream is fully read; don't reuse this connection
+        text = bytes(buf)
+        if complete():
             text = text[:-3]
         return _unstuff(text)
 
@@ -170,10 +207,12 @@ class NNTPConnection:
             else:
                 raise
         if not self.compressed:
+            self.last_compressed = False
             return await self._multiline()
         try:
             return await self._compressed_block()
-        except (zlib.error, ConnectionError, asyncio.IncompleteReadError) as e:
+        except (zlib.error, ConnectionError, OSError, asyncio.IncompleteReadError, asyncio.TimeoutError,
+                TimeoutError, asyncio.LimitOverrunError) as e:
             log.warning("%s: compressed headers failed (%s); using plain headers from now on", self.host, e)
             _NO_COMPRESS.add(self.key)
             self.close()
@@ -325,7 +364,7 @@ class ServerPool:
                 ok = e.code != 400  # 400 means the server may drop this connection
                 raise
             finally:
-                if ok and not self.closed:
+                if ok and not self.closed and not conn.broken:
                     self.idle.append(conn)
                 else:
                     conn.close()

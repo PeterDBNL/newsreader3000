@@ -136,8 +136,10 @@ async def test_status_endpoint(tmp_path):
             assert (await c.get("/")).status_code == 200
 
 
-@pytest.mark.parametrize("compression", [False, True])
-async def test_server_without_over_command(tmp_path, compression):
+@pytest.mark.parametrize("compression", [False, "outside", "inside", "syncflush", "afteronly", "garbage", "stall"])
+async def test_server_without_over_command(tmp_path, compression, monkeypatch):
+    from app import nntp
+    monkeypatch.setattr(nntp, "COMPRESS_STALL_TIMEOUT", 1)
     srv = FakeServer()
     srv.reject_over = True
     srv.compression = compression
@@ -157,7 +159,13 @@ async def test_server_without_over_command(tmp_path, compression):
             assert ".starts with a dot" in [i["subject"] for i in r["items"]]
             log = (await c.get("/api/headers/log", params={"group": "alt.binaries.cores"})).json()
             assert log[0]["status"] == "done" and log[0]["received"] == 4
-            assert log[0]["compressed"] == int(compression)
+            assert log[0]["compressed"] == int(bool(compression) and compression not in ("garbage", "stall"))
+            # a second fetch reuses pooled connections: they must still be in a clean state
+            srv.add("alt.binaries.cores", "later post", b"y")
+            await c.post("/api/groups/fetch", json={"name": "alt.binaries.cores"})
+            await wait_tasks(c)
+            r = (await c.get("/api/browse", params={"group": "alt.binaries.cores", "mode": "files"})).json()
+            assert r["total"] == 3
             info = (await c.get("/api/groups/info", params={"name": "alt.binaries.cores"})).json()
-            assert info["releases"] == 2 and info["files"] == 2
+            assert info["releases"] == 3 and info["files"] == 3
     await srv.stop()

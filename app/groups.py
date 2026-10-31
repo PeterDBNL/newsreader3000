@@ -171,10 +171,13 @@ class GroupService:
 
                     async def get(c):
                         if compress:
-                            state["compressed"] = await c.enable_compression() or state["compressed"]
+                            await c.enable_compression()
                         if c.current_group != group:
                             await c.group(group)
-                        return await c.over_raw(a, b)
+                        data = await c.over_raw(a, b)
+                        state["compressed"] = state["compressed"] or c.last_compressed
+                        return data
+                    t["message"] = t["message"] if state["received"] else f"Waiting for server ({end - start + 1:,} headers to fetch)"
                     raw = await pool.run(get)
                     received, inserted = await asyncio.to_thread(self._ingest, group, raw)
                     state["received"] += received

@@ -23,7 +23,7 @@ from .nntp import CONN_ERRORS, NNTPConnection, NNTPError, Pools
 from .reader import Reader
 from .tasks import Tasks
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 logging.basicConfig(level=os.environ.get("NR_LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("app")

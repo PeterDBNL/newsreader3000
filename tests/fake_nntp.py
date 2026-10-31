@@ -117,7 +117,20 @@ class FakeServer:
                     block = "\r\n".join(out).encode()
                     stuffed = b"".join((b"." + l if l.startswith(b".") else l) + b"\r\n"
                                        for l in (block.split(b"\r\n") if block else [])) + b".\r\n"
-                    w.write(zlib.compress(stuffed) + b".\r\n")
+                    style = self.compression if isinstance(self.compression, str) else "outside"
+                    if style == "outside":  # marker inside and again after the stream
+                        w.write(zlib.compress(stuffed) + b".\r\n")
+                    elif style == "inside":  # complete stream, marker only inside
+                        w.write(zlib.compress(stuffed))
+                    elif style == "syncflush":  # stream never closed, marker only inside
+                        co = zlib.compressobj()
+                        w.write(co.compress(stuffed) + co.flush(zlib.Z_SYNC_FLUSH))
+                    elif style == "afteronly":  # marker only after the stream
+                        w.write(zlib.compress(stuffed[:-3]) + b".\r\n")
+                    elif style == "stall":  # starts sending, then goes silent
+                        w.write(zlib.compress(stuffed)[:8])
+                    else:  # garbage
+                        w.write(b"\x78\x9c this is not deflate data\r\n.\r\n")
                 else:
                     send_block("\r\n".join(out).encode())
             elif up.startswith(("BODY", "ARTICLE", "STAT")):
