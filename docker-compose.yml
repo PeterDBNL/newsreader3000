@@ -1,0 +1,24 @@
+services:
+  newsreader3000:
+    build: .
+    container_name: newsreader3000
+    ports:
+      - "8095:8095"
+    environment:
+      - PUID=99
+      - PGID=100
+      - UMASK=002
+      - TZ=Europe/Amsterdam
+      # Optional: pre-fill your provider on first start (can also be done in the web UI)
+      # - NR_SERVER_HOST=news.eweka.nl
+      # - NR_SERVER_PORT=563
+      # - NR_SERVER_USERNAME=your-username
+      # - NR_SERVER_PASSWORD=your-password
+      # - NR_SERVER_CONNECTIONS=20
+      # Optional: protect the web UI
+      # - NR_UI_USERNAME=admin
+      # - NR_UI_PASSWORD=change-me
+    volumes:
+      - ./config:/config
+      - ./downloads:/downloads
+    restart: unless-stopped

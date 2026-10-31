@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>newsreader3000</Name>
+  <Repository>ghcr.io/peterdbnl/newsreader3000:latest</Repository>
+  <Registry>https://github.com/PeterDBNL/newsreader3000/pkgs/container/newsreader3000</Registry>
+  <Network>bridge</Network>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/PeterDBNL/newsreader3000/issues</Support>
+  <Project>https://github.com/PeterDBNL/newsreader3000</Project>
+  <Overview>Web-based Usenet newsreader and downloader. Browse and search newsgroups on your provider (e.g. Eweka), read posts and view images/NFOs, download releases or NZBs with par2 repair and optional automatic extraction (rar/zip/7z), categories, a watch folder and a backup server.</Overview>
+  <Category>Downloaders: MediaApp:Other</Category>
+  <WebUI>http://[IP]:[PORT:8095]/</WebUI>
+  <Icon>https://raw.githubusercontent.com/PeterDBNL/newsreader3000/main/unraid/icon.png</Icon>
+  <Config Name="Web UI port" Target="8095" Default="8095" Mode="tcp" Description="Port for the web interface" Type="Port" Display="always" Required="true" Mask="false">8095</Config>
+  <Config Name="Config" Target="/config" Default="/mnt/user/appdata/newsreader3000" Mode="rw" Description="Settings, header database and NZB files" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/newsreader3000</Config>
+  <Config Name="Downloads" Target="/downloads" Default="/mnt/user/downloads/usenet" Mode="rw" Description="Downloads go to complete/ (by category), incomplete/ and watch/ inside this folder" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/downloads/usenet</Config>
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User ID files are written as (99 = nobody)" Type="Variable" Display="advanced" Required="false" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group ID files are written as (100 = users)" Type="Variable" Display="advanced" Required="false" Mask="false">100</Config>
+  <Config Name="UMASK" Target="UMASK" Default="002" Mode="" Description="File permission mask" Type="Variable" Display="advanced" Required="false" Mask="false">002</Config>
+  <Config Name="Server host (first start only)" Target="NR_SERVER_HOST" Default="news.eweka.nl" Mode="" Description="Optional. Pre-fills your news server on first start; can also be set in the web UI" Type="Variable" Display="always" Required="false" Mask="false">news.eweka.nl</Config>
+  <Config Name="Server port" Target="NR_SERVER_PORT" Default="563" Mode="" Description="563 for SSL" Type="Variable" Display="advanced" Required="false" Mask="false">563</Config>
+  <Config Name="Server username" Target="NR_SERVER_USERNAME" Default="" Mode="" Description="Optional, first start only" Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Server password" Target="NR_SERVER_PASSWORD" Default="" Mode="" Description="Optional, first start only" Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Server connections" Target="NR_SERVER_CONNECTIONS" Default="20" Mode="" Description="Max connections your plan allows" Type="Variable" Display="advanced" Required="false" Mask="false">20</Config>
+  <Config Name="Web UI username" Target="NR_UI_USERNAME" Default="" Mode="" Description="Optional login for the web UI" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Web UI password" Target="NR_UI_PASSWORD" Default="" Mode="" Description="Optional login for the web UI" Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Time zone" Target="TZ" Default="Europe/Amsterdam" Mode="" Description="" Type="Variable" Display="advanced" Required="false" Mask="false">Europe/Amsterdam</Config>
+</Container>
