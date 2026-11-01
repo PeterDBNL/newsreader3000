@@ -23,7 +23,7 @@ from .nntp import CONN_ERRORS, NNTPConnection, NNTPError, Pools
 from .reader import Reader
 from .tasks import Tasks
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 logging.basicConfig(level=os.environ.get("NR_LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("app")
@@ -87,7 +87,7 @@ async def lifespan(app):
     await S.pools.close_all()
 
 
-app = FastAPI(title="Usenet Reader", version=VERSION, lifespan=lifespan)
+app = FastAPI(title="Newsreader3000", version=VERSION, lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -103,7 +103,7 @@ async def auth_and_errors(request: Request, call_next):
             except Exception:
                 ok = False
         if not ok:
-            return Response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="Usenet Reader"'})
+            return Response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="Newsreader3000"'})
     try:
         return await call_next(request)
     except NNTPError as e:

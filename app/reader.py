@@ -155,7 +155,7 @@ class Reader:
             ("From", frm), ("Newsgroups", ",".join(groups)), ("Subject", subject),
             ("Date", email.utils.formatdate(localtime=False)),
             ("Message-ID", f"<{uuid.uuid4().hex}@{domain}>"),
-            ("User-Agent", "UsenetReader/1.0"), ("MIME-Version", "1.0"),
+            ("User-Agent", "Newsreader3000/1.2"), ("MIME-Version", "1.0"),
             ("Content-Type", "text/plain; charset=UTF-8"), ("Content-Transfer-Encoding", "8bit"),
         ]
         if p.get("organization"):

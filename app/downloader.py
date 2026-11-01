@@ -109,7 +109,7 @@ class Downloader:
 
     async def add_url(self, url, category="", name="", password=""):
         def fetch():
-            req = urllib.request.Request(url, headers={"User-Agent": "UsenetReader/1.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Newsreader3000/1.2"})
             with urllib.request.urlopen(req, timeout=60) as r:
                 data = r.read(50 * 1024 * 1024)
                 cd = r.headers.get("Content-Disposition", "")

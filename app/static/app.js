@@ -1,4 +1,4 @@
-// Usenet Reader single-page UI (vanilla JS, no build step)
+// Newsreader3000 single-page UI (vanilla JS, no build step)
 "use strict";
 
 const $ = (s, el = document) => el.querySelector(s);
