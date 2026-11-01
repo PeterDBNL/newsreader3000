@@ -6,14 +6,19 @@ import time
 
 from .nntp import parse_over_data
 
-from .subjects import parse_subject
+from .subjects import file_counter, is_binary_subject, is_obfuscated, obfuscated_prefix, parse_subject
 
 log = logging.getLogger("groups")
 
 
 class GroupService:
+    # Files of an obfuscated post (random file names) are bundled when the same poster posted the same
+    # number of files within this many seconds of each other.
+    OBF_WINDOW = 3 * 3600
+
     def __init__(self, db, settings, pools, tasks):
         self.db, self.settings, self.pools, self.tasks = db, settings, pools, tasks
+        self._clusters = {}
 
     # ---------- group list ----------
     def refresh_list(self):
@@ -109,14 +114,66 @@ class GroupService:
             await self._fetch(group, mode, count, t)
         return self.tasks.start("headers", label, job)
 
+    def _release_key(self, group, subject, fk, rk, fname, poster, date):
+        if not is_binary_subject(subject) or not is_obfuscated(rk, fname):
+            return rk
+        _, nfiles = file_counter(fk)
+        prefix = obfuscated_prefix(poster, nfiles)
+        ck = (group, prefix)
+        clusters = self._clusters.get(ck)
+        if clusters is None:
+            clusters = [[r["release_key"], r["lo"], r["hi"]] for r in self.db.q(
+                "SELECT release_key, MIN(date) lo, MAX(date) hi FROM files WHERE grp=? AND release_key >= ? "
+                "AND release_key < ? GROUP BY release_key", (group, prefix, prefix + "~"))]
+            self._clusters[ck] = clusters
+            if len(self._clusters) > 20000:
+                self._clusters.clear()
+                self._clusters[ck] = clusters
+        for c in clusters:
+            if c[1] - self.OBF_WINDOW <= date <= c[2] + self.OBF_WINDOW:
+                c[1], c[2] = min(c[1], date), max(c[2], date)
+                return c[0]
+        key = f"{prefix}{date}"
+        clusters.append([key, date, date])
+        return key
+
     def _ingest(self, group, raw):
         """Parse raw overview data and store it (runs in a worker thread)."""
-        rows = []
-        for it in parse_over_data(raw):
-            fk, rk, part, total, fname = parse_subject(it["subject"])
-            rows.append((group, it["num"], it["subject"], it["poster"], it["date"], it["msgid"],
-                         it["parent"], it["bytes"], it["lines"], fk, rk, part, total, fname))
-        return len(rows), (self.db.ingest(group, rows) if rows else 0)
+        items = parse_over_data(raw)
+        with self.db.wlock:  # release bundling must see a consistent view across parallel batches
+            rows = []
+            for it in items:
+                fk, rk, part, total, fname = parse_subject(it["subject"])
+                rk = self._release_key(group, it["subject"], fk, rk, fname, it["poster"], it["date"])
+                rows.append((group, it["num"], it["subject"], it["poster"], it["date"], it["msgid"],
+                             it["parent"], it["bytes"], it["lines"], fk, rk, part, total, fname))
+            return len(rows), (self.db.ingest(group, rows) if rows else 0)
+
+    def regroup(self, t=None):
+        """Recompute release grouping for all stored headers (after the grouping rules improved)."""
+        groups = [r["grp"] for r in self.db.q("SELECT DISTINCT grp FROM articles")]
+        for gi, g in enumerate(groups):
+            if t is not None:
+                t["message"] = f"Re-grouping {g} ({gi + 1}/{len(groups)})"
+            with self.db.wlock:
+                self._clusters = {k: v for k, v in self._clusters.items() if k[0] != g}
+                self.db.x("DELETE FROM files WHERE grp=? AND release_key >= ? AND release_key < ?",
+                          (g, "Obfuscated post", "Obfuscated post~"))
+                last = 0
+                while True:
+                    rows = self.db.q("SELECT id, subject, poster, date FROM articles WHERE grp=? AND id>? "
+                                     "ORDER BY id LIMIT 20000", (g, last))
+                    if not rows:
+                        break
+                    last = rows[-1]["id"]
+                    upd = []
+                    for r in rows:
+                        fk, rk, _, _, fname = parse_subject(r["subject"])
+                        upd.append((self._release_key(g, r["subject"], fk, rk, fname, r["poster"], r["date"]), r["id"]))
+                    self.db.many("UPDATE articles SET release_key=? WHERE id=?", upd)
+                self.db.rebuild(g)
+                self._clusters = {k: v for k, v in self._clusters.items() if k[0] != g}
+        self.db.set_version()
 
     async def _fetch(self, group, mode, count, t):
         cfg = self.settings.get("headers")

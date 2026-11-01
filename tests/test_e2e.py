@@ -169,3 +169,38 @@ async def test_server_without_over_command(tmp_path, compression, monkeypatch):
             info = (await c.get("/api/groups/info", params={"name": "alt.binaries.cores"})).json()
             assert info["releases"] == 3 and info["files"] == 3
     await srv.stop()
+
+
+async def test_obfuscated_posts_are_bundled(tmp_path):
+    srv = FakeServer()
+    for i, name in enumerate(["k3j4h5g6f7d8s9a0.rar", "z9x8c7v6b5n4m3q2.rar", "p0o9i8u7y6t5r4e3.par2"], 1):
+        srv.add_binary("alt.binaries.obf", name, os.urandom(4000), prefix=f"[{i}/3]")
+    for _, h, _ in srv.groups["alt.binaries.obf"]:
+        h["From"] = "Poster One <one@x>"
+    # another poster, same file count: must stay a separate release
+    srv.add_binary("alt.binaries.obf", "q1w2e3r4t5y6u7i8.rar", os.urandom(100), prefix="[1/3]")
+    # a normally named release next to it
+    srv.add_binary("alt.binaries.obf", "Normal.Release.part1.rar", os.urandom(100), prefix="[1/2]")
+    srv.add_binary("alt.binaries.obf", "Normal.Release.part2.rar", os.urandom(100), prefix="[2/2]")
+    await srv.start()
+    from app import main as m
+    m.init(str(tmp_path / "config5"))
+    m.S.settings.update({"servers": [{"name": "x", "host": "127.0.0.1", "port": srv.port, "ssl": False,
+                                      "username": "u", "password": "p", "connections": 4}]})
+    async with m.app.router.lifespan_context(m.app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=m.app), base_url="http://t") as c:
+            await c.post("/api/groups/subscribe", json={"names": ["alt.binaries.obf"], "fetch": True})
+            await wait_tasks(c)
+            rel = (await c.get("/api/browse", params={"group": "alt.binaries.obf"})).json()
+            by = {(r["poster"], r["files"]) for r in rel["items"]}
+            assert rel["total"] == 3, [r["name"] for r in rel["items"]]
+            assert ("Poster One <one@x>", 3) in by
+            names = [r["name"] for r in rel["items"]]
+            assert "Normal.Release" in names
+            obf = [r for r in rel["items"] if r["files"] == 3][0]
+            assert obf["name"].startswith("Obfuscated post · 3 files · Poster One")
+            # the bundle downloads as one job with all three files
+            nzb = await c.post("/api/nzb", json={"items": [{"kind": "release", "grp": "alt.binaries.obf",
+                                                            "key": obf["k"]}]})
+            assert nzb.content.count(b"<file ") == 3
+    await srv.stop()

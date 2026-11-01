@@ -59,3 +59,38 @@ def parse_subject(subject):
 
 def is_binary_subject(subject):
     return bool(YENC_RE.search(subject or "")) or bool(SEG_RE.search(subject or ""))
+
+
+FILE_COUNT_RE = re.compile(r"[\[\(]\s*(\d+)\s*(?:/|of)\s*(\d+)\s*[\]\)]|\b(\d+)\s+of\s+(\d+)\b", re.I)
+RANDOM_RE = re.compile(r"^[A-Za-z0-9]{12,}$")
+HEXISH_RE = re.compile(r"^[0-9a-fA-F-]{16,}$")
+
+
+def file_counter(file_key):
+    """The [3/45] style file counter of a post: (3, 45), or (0, 0) when there is none."""
+    m = FILE_COUNT_RE.search(file_key or "")
+    if not m:
+        return 0, 0
+    a, b = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+    return int(a), int(b)
+
+
+def is_obfuscated(release_key, filename):
+    """True when the file name carries no usable release name (random strings or no name at all),
+    so files of one post can't be matched by name."""
+    base = strip_ext(filename) if filename else ""
+    if base:
+        if HEXISH_RE.match(base):
+            return True
+        if RANDOM_RE.match(base) and re.search(r"\d", base) and re.search(r"[A-Za-z]", base):
+            return True
+        return False
+    words = re.sub(r"[\W_]+", " ", release_key or "").split()
+    return len(" ".join(words)) < 4
+
+
+OBF_PREFIX = "Obfuscated post"
+
+
+def obfuscated_prefix(poster, nfiles):
+    return f"{OBF_PREFIX} · {nfiles or '?'} files · {poster} · #"

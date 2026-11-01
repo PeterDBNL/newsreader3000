@@ -75,6 +75,7 @@ DROP TABLE IF EXISTS articles_fts;
 DROP INDEX IF EXISTS idx_art_rel;
 """
 
+SCHEMA_VERSION = 2
 CHUNK = 400  # max keys per IN (...) list
 
 
@@ -88,8 +89,16 @@ class DB:
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript(MIGRATIONS)
         c.executescript(SCHEMA)
-        self.needs_rebuild = bool(c.execute("SELECT 1 FROM articles LIMIT 1").fetchone()) and \
-            not c.execute("SELECT 1 FROM files LIMIT 1").fetchone()
+        has_articles = bool(c.execute("SELECT 1 FROM articles LIMIT 1").fetchone())
+        self.needs_rebuild = has_articles and not c.execute("SELECT 1 FROM files LIMIT 1").fetchone()
+        # version 2: obfuscated posts are bundled into releases; older data needs re-grouping
+        self.needs_regroup = has_articles and c.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION
+        if not has_articles:
+            self.set_version()
+
+    def set_version(self):
+        self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        self.needs_regroup = False
 
     @property
     def conn(self):

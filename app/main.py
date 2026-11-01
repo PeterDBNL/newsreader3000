@@ -23,7 +23,7 @@ from .nntp import CONN_ERRORS, NNTPConnection, NNTPError, Pools
 from .reader import Reader
 from .tasks import Tasks
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 logging.basicConfig(level=os.environ.get("NR_LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("app")
@@ -73,12 +73,12 @@ async def lifespan(app):
     if not hasattr(S, "settings"):
         init()
     S.downloader = Downloader(S.db, S.settings, S.pools, S.settings.config_dir)
-    if S.db.needs_rebuild:
-        async def rebuild(t):
-            t["message"] = "Indexing stored headers into releases (one-time upgrade)..."
-            await asyncio.to_thread(S.db.rebuild)
+    if S.db.needs_rebuild or S.db.needs_regroup:
+        async def upgrade(t):
+            t["message"] = "Grouping stored headers into releases (one-time upgrade)..."
+            await asyncio.to_thread(S.groups.regroup, t)
             t["message"] = "Done"
-        S.tasks.start("upgrade", "Upgrade header index", rebuild)
+        S.tasks.start("upgrade", "Upgrade header index", upgrade)
     S.downloader.start()
     sched = asyncio.get_running_loop().create_task(scheduler())
     yield

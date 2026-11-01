@@ -59,16 +59,22 @@ def test_upgrade_from_v1_0_database(tmp_path):
       INSERT INTO articles_fts(rowid, subject, poster) VALUES (new.id, new.subject, new.poster); END;
     """)
     for i in range(1, 7):
-        fk, rk, part, total, fn = subjects.parse_subject(f'[1/2] - "Old.Release.part{(i - 1) // 3 + 1}.rar" yEnc ({(i - 1) % 3 + 1}/3)')
+        subj = f'[1/2] - "Old.Release.part{(i - 1) // 3 + 1}.rar" yEnc ({(i - 1) % 3 + 1}/3)'
+        fk, rk, part, total, fn = subjects.parse_subject(subj)
         c.execute("INSERT INTO articles(grp,num,subject,poster,date,msgid,bytes,file_key,release_key,part,total,filename) "
-                  "VALUES('g',?,?,?,?,?,?,?,?,?,?,?)", (i, "s", "p", 100, f"<{i}>", 10, fk, rk, part, total, fn))
+                  "VALUES('g',?,?,?,?,?,?,?,?,?,?,?)", (i, subj, "p", 100, f"<{i}>", 10, fk, rk, part, total, fn))
+    c.execute("INSERT INTO articles(grp,num,subject,poster,date,msgid,bytes,file_key,release_key,part,total,filename) "
+              "VALUES('g',7,'Hi','p',100,'<7>',10,'Hi','Hi',1,1,'')")
     c.commit()
     c.close()
     d = DB(path)
-    assert d.needs_rebuild
-    d.rebuild()
-    rel = d.q("SELECT release_key, files, parts, expected, size FROM releases")
-    assert rel == [{"release_key": "Old.Release", "files": 2, "parts": 6, "expected": 6, "size": 60}]
+    assert d.needs_rebuild and d.needs_regroup
+    from app.groups import GroupService
+    GroupService(d, None, None, None).regroup()
+    assert not d.needs_regroup and not DB(path).needs_regroup
+    rel = d.q("SELECT release_key, files, parts, expected, size FROM releases ORDER BY release_key")
+    assert rel == [{"release_key": "Hi", "files": 1, "parts": 1, "expected": 1, "size": 10},
+                   {"release_key": "Old.Release", "files": 2, "parts": 6, "expected": 6, "size": 60}]
     assert not d.q("SELECT name FROM sqlite_master WHERE name='articles_fts'")
     # new inserts work without the old trigger
     d.ingest("g", [("g", 99, "x", "p", 1, "<99>", "", 5, 1, "x", "x", 1, 1, "")])

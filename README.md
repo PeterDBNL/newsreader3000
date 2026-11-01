@@ -23,6 +23,8 @@ Connect it to your provider (for example Eweka), then browse, search, read and d
   - **Files**: each file on its own, with its parts
   - **Articles**: raw posts, for text/discussion groups
 - Click or Shift-click rows to select a range of releases
+- **Obfuscated posts are bundled**: files with random names that were posted by the same poster, with the same file count (`[3/45]`), within a few hours of each other show as one release ("Obfuscated post · 45 files · poster")
+- Clear search feedback: a spinner while a search runs, then the number of matches and how long it took. Enter searches immediately
 - Filter by words (`-word` excludes a word), minimum size and maximum age. Sort by date, size or name. Read/unread tracking with a "hide read" option and "mark all read"
 - Article viewer with headers, text (quotes dimmed, links clickable), thread view, inline images for yEnc/MIME/UU attachments, and attachment downloads
 - **Preview** files inside a release without downloading the whole thing: images, NFOs (DOS art shown correctly), text, PDF, audio, short video (up to 64 MB)

@@ -138,13 +138,15 @@ function resultTable(res, mode, opts = {}) {
       const extra = mode === "releases" ? `<span class="pill">${r.files} file${r.files === 1 ? "" : "s"}</span>${r.par2 ? '<span class="pill">par2</span>' : ""}${r.nfo ? `<span class="pill"><a onclick="event.stopPropagation();previewFile('${esc(r.grp)}', ${jsStr(r.nfo)}, true)">nfo</a></span>` : ""}` : `<span class="pill">${r.parts}${r.expected ? "/" + r.expected : ""} parts</span>`;
       return `<tr class="${r.is_read ? "read" : ""}" data-i="${i}">
       <td><input type="checkbox" class="selbox" data-i="${i}"></td>
-      <td class="subj"><a onclick="openItem(${i})">${esc(r.name)}</a> ${extra}${comp}${showGroup ? `<div class="small muted">${esc(r.grp)}</div>` : ""}</td>
+      <td class="subj"><a onclick="openItem(${i})">${esc(displayName(r.name))}</a> ${extra}${comp}${showGroup ? `<div class="small muted">${esc(r.grp)}</div>` : ""}</td>
       <td class="small hm">${esc(shortPoster(r.poster))}</td><td class="num">${fmtSize(r.size)}</td>
       <td class="num" title="${esc(fmtDate(r.date))}">${fmtAge(r.date)}</td></tr>`;
     });
   }
   return `<table class="results"><thead><tr><th style="width:28px"><input type="checkbox" id="selall"></th><th>${mode === "articles" ? "Subject" : mode === "files" ? "File" : "Release"}</th><th class="hm">Poster</th><th class="num">Size</th><th class="num">Age</th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
 }
+// Bundled obfuscated posts carry an internal "· #<time>" suffix to keep them apart; don't show it.
+const displayName = (n) => String(n ?? "").replace(/ · #\d+$/, "");
 const jsStr = (s) => esc(JSON.stringify(s));
 const shortPoster = (p) => (p || "").replace(/<[^>]*>/, "").trim() || p;
 
@@ -232,6 +234,16 @@ async function markSelected(read) {
   clearSel();
   loadBrowse();
 }
+let searchSeq = 0;
+function setBusy(resultsEl, statusEl, on, text) {
+  resultsEl?.classList.toggle("busy", on);
+  if (statusEl) statusEl.innerHTML = on ? `<span class="spinner"></span> ${esc(text || "Searching…")}` : esc(text || "");
+}
+function summary(res, mode, q, ms) {
+  const noun = { releases: "release", files: "file", articles: "article" }[mode] || "result";
+  const n = res.total.toLocaleString();
+  return `${n} ${noun}${res.total === 1 ? "" : "s"}${q ? ` matching “${q}”` : ""} · ${(ms / 1000).toFixed(2)} s`;
+}
 function pager(res, st, reload) {
   const limit = 100;
   if (res.total <= limit) return `<div class="pager muted small">${res.total.toLocaleString()} result${res.total === 1 ? "" : "s"}</div>`;
@@ -250,7 +262,7 @@ async function openItem(i) {
   const kind = (state.view === "search" ? state.search.mode : state.browse.mode) === "files" ? "file" : "release";
   await guard(async () => {
     const files = await api(`/api/release?group=${encodeURIComponent(it.grp)}&key=${encodeURIComponent(it.k)}&kind=${kind}`);
-    openModal(`<h3 style="padding-right:30px">${esc(it.name)}</h3>
+    openModal(`<h3 style="padding-right:30px">${esc(displayName(it.name))}</h3>
       <div class="muted small">${esc(it.grp)} · ${esc(it.poster)} · ${fmtDate(it.date)} · ${fmtSize(it.size)}</div>
       <div class="toolbar" style="margin-top:10px"><button onclick='quickDownload(${jsStr(JSON.stringify({ kind, grp: it.grp, key: it.k, name: it.name }))})'>⬇ Download all</button></div>
       <table class="files"><tr><th>File</th><th class="num">Parts</th><th class="num">Size</th><th></th></tr>
@@ -362,12 +374,12 @@ function viewBrowse() {
     <div id="ginfo" class="small muted" style="margin:-4px 0 10px"></div>
     <div class="toolbar">
       <select id="bmode"><option value="releases">Releases</option><option value="files">Files</option><option value="articles">Articles</option></select>
-      <input id="bq" class="grow" placeholder="Filter subjects…  (use -word to exclude)" value="${esc(st.q)}">
+      <input id="bq" class="grow" type="search" placeholder="Filter releases… press Enter  (use -word to exclude)" value="${esc(st.q)}">
       <input id="bmin" class="num" placeholder="Min MB" value="${esc(st.min_size)}">
       <input id="bage" class="num" placeholder="Max days" value="${esc(st.max_age)}">
       <select id="bsort"><option value="date">Newest</option><option value="oldest">Oldest</option><option value="size">Largest</option><option value="name">Name</option></select>
       <label class="c"><input type="checkbox" id="bhide" ${st.hide_read ? "checked" : ""}> Hide read</label>
-    </div>${selectionBar("browse")}<div id="bres"></div></div></div></div>`;
+    </div><div id="bstatus" class="statusline"></div>${selectionBar("browse")}<div id="bres"></div></div></div></div>`;
   $("#bmode").value = st.mode;
   $("#bsort").value = st.sort;
   const reload = () => { st.offset = 0; loadBrowse(); };
@@ -375,7 +387,11 @@ function viewBrowse() {
   $("#bsort").onchange = () => { st.sort = $("#bsort").value; reload(); };
   $("#bhide").onchange = () => { st.hide_read = $("#bhide").checked ? 1 : 0; reload(); };
   let tmr;
-  for (const id of ["bq", "bmin", "bage"]) $("#" + id).oninput = () => { clearTimeout(tmr); tmr = setTimeout(() => { st.q = $("#bq").value; st.min_size = $("#bmin").value; st.max_age = $("#bage").value; reload(); }, 350); };
+  const apply = () => { clearTimeout(tmr); st.q = $("#bq").value; st.min_size = $("#bmin").value; st.max_age = $("#bage").value; reload(); };
+  for (const id of ["bq", "bmin", "bage"]) {
+    $("#" + id).oninput = () => { clearTimeout(tmr); tmr = setTimeout(apply, 500); };
+    $("#" + id).onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); apply(); } };
+  }
   loadGroupSidebar();
   loadBrowse();
   loadGroupInfo();
@@ -426,11 +442,19 @@ async function loadBrowse() {
   const st = state.browse;
   if (!state.group) { el.innerHTML = `<div class="empty">Choose a subscribed group on the left.</div>`; return; }
   const p = new URLSearchParams({ group: state.group, mode: st.mode, q: st.q, offset: st.offset, hide_read: st.hide_read, sort: st.sort, min_size: st.min_size || 0, max_age: st.max_age || 0 });
+  const seq = ++searchSeq, t0 = performance.now();
+  setBusy(el, $("#bstatus"), true, st.q ? `Searching for “${st.q}”…` : "Loading…");
   try {
     const res = await api("/api/browse?" + p);
+    if (seq !== searchSeq) return;  // a newer search was started
+    setBusy(el, $("#bstatus"), false, summary(res, st.mode, st.q, performance.now() - t0));
     el.innerHTML = resultTable(res, st.mode, { empty: st.q ? "No matches." : `No headers stored for this group yet. <a onclick="fetchHeaders('new')">Download headers now</a>.` }) + pager(res, st, loadBrowse);
     bindResults(el, st.mode);
-  } catch (e) { el.innerHTML = `<div class="empty status-failed">${esc(e.message)}</div>`; }
+  } catch (e) {
+    if (seq !== searchSeq) return;
+    setBusy(el, $("#bstatus"), false, "");
+    el.innerHTML = `<div class="empty status-failed">${esc(e.message)}</div>`;
+  }
 }
 async function fetchHeaders(mode, count) {
   if (!state.group) return toast("Pick a group first", true);
@@ -455,7 +479,7 @@ async function viewSearch() {
   main().innerHTML = `<div class="panel"><form id="sform" class="toolbar">
       <input id="sq" class="grow" placeholder='Search subjects in your groups… e.g. ubuntu 24.04 iso  -beta  "exact words"' value="${esc(st.q)}" autofocus>
       <select id="smode"><option value="releases">Releases</option><option value="files">Files</option><option value="articles">Articles</option></select>
-      <button type="submit">Search</button></form>
+      <button type="submit" id="sbtn">Search</button></form><div id="sstatus" class="statusline"></div>
     <div class="toolbar">
       <input id="smin" class="num" placeholder="Min MB" value="${esc(st.min_size)}"><input id="smax" class="num" placeholder="Max MB" value="${esc(st.max_size)}">
       <input id="sage" class="num" placeholder="Max days" value="${esc(st.max_age)}"><input id="spos" placeholder="Poster contains" value="${esc(st.poster)}">
@@ -481,13 +505,22 @@ async function runSearch() {
   st.q = $("#sq").value; st.mode = $("#smode").value; st.min_size = $("#smin").value; st.max_size = $("#smax").value;
   st.max_age = $("#sage").value; st.poster = $("#spos").value; st.sort = $("#ssort").value;
   const el = $("#sres");
-  el.innerHTML = '<div class="empty">Searching…</div>';
   const p = new URLSearchParams({ q: st.q, groups: st.groups, mode: st.mode, offset: st.offset, min_size: st.min_size || 0, max_size: st.max_size || 0, max_age: st.max_age || 0, poster: st.poster, sort: st.sort });
+  const seq = ++searchSeq, t0 = performance.now();
+  setBusy(el, $("#sstatus"), true, `Searching for “${st.q}”…`);
+  $("#sbtn").disabled = true; $("#sbtn").textContent = "Searching…";
   try {
     const res = await api("/api/search?" + p);
+    if (seq !== searchSeq) return;
+    setBusy(el, $("#sstatus"), false, summary(res, st.mode, st.q, performance.now() - t0));
     el.innerHTML = resultTable(res, st.mode, { showGroup: true, empty: "No matches in the downloaded headers. Try more groups or fetch older headers." }) + pager(res, st, runSearch);
     bindResults(el, st.mode);
-  } catch (e) { el.innerHTML = `<div class="empty status-failed">${esc(e.message)}</div>`; }
+  } catch (e) {
+    setBusy(el, $("#sstatus"), false, "");
+    el.innerHTML = `<div class="empty status-failed">${esc(e.message)}</div>`;
+  } finally {
+    if ($("#sbtn")) { $("#sbtn").disabled = false; $("#sbtn").textContent = "Search"; }
+  }
 }
 
 // ------------------------------------------------------------------ Groups view

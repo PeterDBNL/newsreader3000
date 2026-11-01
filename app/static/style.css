@@ -75,3 +75,7 @@ label.c{display:flex;gap:8px;align-items:center;font-size:13px}
 .drop{border:2px dashed var(--line);border-radius:12px;padding:18px;text-align:center;color:var(--muted)}
 .drop.over{border-color:var(--accent);color:var(--accent)}
 .server{border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:10px}
+.statusline{min-height:20px;font-size:13px;color:var(--muted);margin:-2px 0 8px;display:flex;align-items:center;gap:8px}
+.busy{opacity:.4;pointer-events:none;transition:opacity .15s}
+.spinner{width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;display:inline-block;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
